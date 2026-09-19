@@ -1,0 +1,35 @@
+###############################################
+# MediaMTX Low-Latency Configuration
+###############################################
+
+# General logging
+logLevel: info
+logDestinations: [stdout]
+
+# Global RTMP Ingestion Server Settings
+rtmp: yes
+rtmpAddress: :1935
+rtmpEncryption: "no"
+
+# RTSP Server Settings (Optional/Fallback)
+rtsp: yes
+rtspAddress: :8554
+protocols: [tcp]
+
+# WebRTC & HLS (Disabled or optimized for minimum overhead)
+hls: no
+webrtc: no
+
+# Stream Path Definitions
+paths:
+  # Catch-all path for any dynamic stream ID (e.g., drone_alpha)
+  all:
+    # Disable publisher authentication for local processing
+    publishUser: ""
+    publishPass: ""
+    
+    # Enable buffer flushing for sub-50ms glass-to-glass latency
+    overridePublisher: yes
+    
+    # Keep stream active in memory immediately
+    sourceOnDemand: no

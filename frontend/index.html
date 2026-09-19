@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DECS Tactical C2 Radar</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif; }
+        body { background: #070a12; color: #f1f5f9; display: flex; flex-direction: column; height: 100vh; overflow: hidden; user-select: none; }
+        
+        header { 
+            background: #0f172a; 
+            padding: 6px 14px; 
+            display: flex; 
+            align-items: center; 
+            justify-content: space-between; 
+            border-bottom: 2px solid #0284c7; 
+            z-index: 100;
+            height: 52px;
+        }
+        .title { font-size: 1.1rem; font-weight: 800; color: #38bdf8; display: flex; align-items: center; gap: 8px; letter-spacing: 0.05em; white-space: nowrap; }
+        .controls { display: flex; gap: 6px; align-items: center; }
+        
+        select, input { 
+            background: #1e293b; 
+            border: 1px solid #334155; 
+            color: #fff; 
+            padding: 5px 8px; 
+            border-radius: 4px; 
+            font-size: 0.80rem; 
+            outline: none;
+        }
+        select { font-weight: 600; color: #38bdf8; cursor: pointer; }
+        select:focus, input:focus { border-color: #38bdf8; }
+
+        .source-select {
+            color: #38bdf8;
+            border-color: #0284c7;
+            background: #081a30;
+            font-weight: 700;
+        }
+
+        button { 
+            background: #0284c7; 
+            color: white; 
+            border: none; 
+            padding: 5px 12px; 
+            border-radius: 4px; 
+            font-weight: 600; 
+            font-size: 0.80rem; 
+            cursor: pointer; 
+            transition: all 0.2s; 
+            white-space: nowrap;
+        }
+        button:hover { background: #0369a1; }
+        button.disconnect { background: #ef4444; }
+        button.disconnect:hover { background: #dc2626; }
+
+        .badge { 
+            background: #064e3b; 
+            color: #6ee7b7; 
+            font-size: 0.72rem; 
+            padding: 3px 8px; 
+            border-radius: 9999px; 
+            font-family: monospace;
+            border: 1px solid #059669;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #10b981; }
+
+        /* Top Action Ribbon for Aspect Ratio & Crop Customization */
+        .top-action-ribbon {
+            background: #090e1a;
+            border-bottom: 1px solid #1e293b;
+            padding: 5px 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            z-index: 90;
+        }
+        .ribbon-group { display: flex; align-items: center; gap: 6px; }
+        .ribbon-label { font-size: 0.70rem; font-weight: 800; color: #94a3b8; letter-spacing: 0.05em; }
+        .btn-crop-preset {
+            background: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 3px 8px; font-size: 0.72rem; font-weight: 700; border-radius: 3px; cursor: pointer;
+        }
+        .btn-crop-preset:hover, .btn-crop-preset.active { background: #f59e0b; color: #000; border-color: #d97706; }
+        .slider-control { display: flex; align-items: center; gap: 5px; font-size: 0.70rem; color: #94a3b8; font-weight: 600; }
+        .slider-control input[type=range] { width: 75px; padding: 0; cursor: pointer; }
+
+        /* Workspace Grid */
+        main { display: flex; flex: 1; height: calc(100vh - 86px); background: #000; overflow: hidden; position: relative; }
+        .video-stage { position: relative; background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden; flex: 1; min-width: 320px; height: 100%; }
+        .resizer { width: 8px; cursor: col-resize; background: #1e293b; border-left: 1px solid #334155; border-right: 1px solid #334155; z-index: 50; }
+        .resizer:hover, .resizer.dragging { background: #0284c7; }
+
+        .viewport-wrapper { position: relative; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; overflow: hidden; }
+        #video-canvas { width: 100% !important; height: 100% !important; object-fit: fill !important; display: none; transition: transform 0.1s ease-out; }
+
+        .hud-overlay-banner { position: absolute; top: 10px; left: 10px; background: rgba(15, 23, 42, 0.90); border: 1px solid #0284c7; padding: 5px 10px; border-radius: 4px; font-size: 0.70rem; font-family: monospace; color: #38bdf8; pointer-events: none; z-index: 10; }
+
+        .right-sidebar { width: 380px; min-width: 280px; max-width: 650px; display: flex; flex-direction: column; background: #0f172a; overflow: hidden; height: 100%; }
+        .map-container { height: 42%; position: relative; border-bottom: 2px solid #1e293b; }
+        #map { width: 100%; height: 100%; }
+
+        .category-stats-bar { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 6px 10px; background: #111827; border-bottom: 1px solid #1e293b; }
+        .stat-pill { background: #1e293b; padding: 4px 6px; border-radius: 4px; text-align: center; font-size: 0.70rem; font-weight: 700; }
+        .stat-pill.human { border-left: 3px solid #00ff80; color: #86efac; }
+        .stat-pill.animal { border-left: 3px solid #00d7ff; color: #7dd3fc; }
+        .stat-pill.object { border-left: 3px solid #a855f7; color: #d8b4fe; }
+
+        .targets-panel { flex: 1; padding: 8px 10px; overflow-y: auto; display: flex; flex-direction: column; }
+        .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid #1e293b; }
+        .panel-header h4 { color: #94a3b8; font-size: 0.78rem; letter-spacing: 0.05em; }
+
+        .target-card { background: #1e293b; padding: 8px 10px; border-radius: 4px; margin-bottom: 5px; font-size: 0.82rem; display: flex; justify-content: space-between; align-items: center; }
+        .target-card.human { border-left: 4px solid #00ff80; }
+        .target-card.animal { border-left: 4px solid #00d7ff; }
+        .target-card.object { border-left: 4px solid #a855f7; }
+
+        .cat-tag { font-size: 0.65rem; padding: 2px 5px; border-radius: 3px; text-transform: uppercase; font-weight: 800; margin-right: 6px; }
+        .tag-human { background: rgba(0, 255, 128, 0.2); color: #00ff80; }
+        .tag-animal { background: rgba(0, 215, 255, 0.2); color: #00d7ff; }
+        .tag-object { background: rgba(168, 85, 247, 0.2); color: #a855f7; }
+
+        .target-meta { display: flex; flex-direction: column; gap: 2px; }
+        .target-coords { color: #94a3b8; font-size: 0.70rem; font-family: monospace; }
+        .target-conf { font-weight: 800; font-size: 0.90rem; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="title">
+            <span>DECS C2 TACTICAL HUD</span>
+            <div id="loc-badge" class="badge">
+                <span class="status-dot"></span>
+                <span id="loc-text">Acquiring GPS...</span>
+            </div>
+        </div>
+        <div class="controls">
+            <!-- Dynamic Source Protocol Selector -->
+            <select id="source-type" class="source-select" onchange="renderSourceInputs()">
+                <option value="skydroid">SKYDROID REMOTE (H12/H16)</option>
+                <option value="rtmp">RTMP DRONE/MOBILE BROADCAST</option>
+                <option value="rtsp">NATIVE RTSP CAMERA/DRONE</option>
+                <option value="http">HTTP / HTTPS LIVE STREAM</option>
+                <option value="custom">RAW CUSTOM URI (UDP/RTSP/RTMP)</option>
+            </select>
+
+            <!-- Container for Dynamic Input Fields -->
+            <span id="dynamic-inputs" style="display: flex; gap: 6px;"></span>
+
+            <select id="filter-category" onchange="changeCategoryFilter()">
+                <option value="ALL">ALL TARGETS</option>
+                <option value="HUMAN">HUMANS ONLY</option>
+                <option value="ANIMAL">ANIMALS ONLY</option>
+                <option value="OBJECT">OBJECTS ONLY</option>
+            </select>
+
+            <button id="btn-connect" onclick="toggleStream()">Connect</button>
+        </div>
+    </header>
+
+    <!-- Top Action Ribbon for Aspect Ratio & Crop Customization -->
+    <div class="top-action-ribbon">
+        <div class="ribbon-group">
+            <span class="ribbon-label">CROP / RATIO:</span>
+            <button class="btn-crop-preset active" onclick="setRatioPreset('fill')">FULL FILL (NO BORDERS)</button>
+            <button class="btn-crop-preset" onclick="setRatioPreset('cover')">ZOOM CROP</button>
+            <button class="btn-crop-preset" onclick="setRatioPreset('16-9')">16:9</button>
+            <button class="btn-crop-preset" onclick="setRatioPreset('4-3')">4:3</button>
+            <button class="btn-crop-preset" onclick="setRatioPreset('9-16')">9:16</button>
+            <button class="btn-crop-preset" onclick="setRatioPreset('contain')">ORIGINAL</button>
+        </div>
+
+        <div class="ribbon-group">
+            <span class="ribbon-label">ALIGN:</span>
+            <select id="feed-rotate" onchange="updateOrientation()" style="padding: 2px 6px; font-size: 0.72rem;">
+                <option value="0">0° (NORMAL)</option>
+                <option value="90">90° (PORTRAIT)</option>
+                <option value="180">180° (UPSIDE DOWN)</option>
+                <option value="270">270° (REVERSE)</option>
+            </select>
+        </div>
+
+        <div class="ribbon-group">
+            <div class="slider-control">
+                <span>ZOOM</span>
+                <input type="range" id="zoom-slider" min="0.5" max="2.5" step="0.05" value="1.0" oninput="applyAdjustments()">
+            </div>
+            <div class="slider-control">
+                <span>WIDTH</span>
+                <input type="range" id="width-slider" min="50" max="160" step="1" value="100" oninput="applyAdjustments()">
+            </div>
+            <button class="btn-crop-preset" onclick="resetAdjustments()">RESET</button>
+        </div>
+
+        <div class="ribbon-group">
+            <span class="ribbon-label">RECORD DETECTED FEED:</span>
+            <input type="text" id="record-save-dir" placeholder="Save folder e.g. C:\Users\you\Videos\DECS" style="width: 260px; font-size: 0.72rem; padding: 3px 6px;">
+            <button id="btn-record-start" class="btn-crop-preset" onclick="startRecording()">● RECORD</button>
+            <button id="btn-record-pause" class="btn-crop-preset" onclick="pauseRecording()" disabled>PAUSE</button>
+            <button id="btn-record-resume" class="btn-crop-preset" onclick="resumeRecording()" disabled style="display:none;">RESUME</button>
+            <button id="btn-record-stop" class="btn-crop-preset" onclick="stopRecording()" disabled>STOP</button>
+            <span id="record-status" style="font-size: 0.72rem; color: #94a3b8; margin-left: 4px;">Not recording</span>
+        </div>
+    </div>
+
+    <main id="main-container">
+        <!-- Live Video Stage -->
+        <div id="video-pane" class="video-stage">
+            <div id="hud-banner" class="hud-overlay-banner">VIEWPORT: READY | SUB-20MS</div>
+            <div id="video-placeholder" style="color: #64748b; font-size: 0.9rem;">Stream Disconnected</div>
+            
+            <div id="viewport-wrapper" class="viewport-wrapper">
+                <canvas id="video-canvas"></canvas>
+            </div>
+        </div>
+
+        <!-- Draggable Resizer -->
+        <div id="drag-resizer" class="resizer"></div>
+
+        <!-- Radar & Target Sidebar -->
+        <div id="sidebar-pane" class="right-sidebar">
+            <div class="map-container"><div id="map"></div></div>
+            <div class="category-stats-bar">
+                <div class="stat-pill human">HUMANS: <span id="count-humans">0</span></div>
+                <div class="stat-pill animal">ANIMALS: <span id="count-animals">0</span></div>
+                <div class="stat-pill object">OBJECTS: <span id="count-objects">0</span></div>
+            </div>
+            <div class="targets-panel" style="margin-bottom: 8px;">
+                <div class="panel-header">
+                    <h4>TARGET LOCK</h4>
+                    <span id="target-lock-status" style="font-size: 0.72rem; color: #94a3b8; font-weight: 700;">Inactive</span>
+                </div>
+                <div style="display:flex; flex-direction:column; gap:6px; padding: 6px 2px;">
+                    <span style="font-size: 0.68rem; color: #64748b;">
+                        Upload a photo of a specific person/object/animal. Matching uses
+                        keypoint + color-signature comparison (not face recognition) --
+                        best for distinct objects/vehicles/animals and reasonably for a
+                        specific person's overall appearance at working distance.
+                    </span>
+                    <input type="file" id="target-image-input" accept="image/*" style="font-size: 0.72rem;">
+                    <div style="display:flex; gap:6px;">
+                        <button class="btn-crop-preset" onclick="setTargetLock()" style="flex:1;">SEARCH FOR THIS TARGET</button>
+                        <button class="btn-crop-preset" onclick="clearTargetLock()" style="flex:1;">CLEAR LOCK</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="targets-panel">
+                <div class="panel-header">
+                    <h4>TARGET IDENTIFICATION LOG</h4>
+                    <span id="target-count" style="font-size: 0.75rem; color: #38bdf8; font-weight: 700;">0 Visible</span>
+                </div>
+                <div id="targets-list"></div>
+            </div>
+        </div>
+    </main>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        let map, hostMarker, isConnected = false;
+        let markers = [];
+        let currentLat = 17.0253;
+        let currentLon = 81.7779;
+        let currentRotation = 0;
+        
+        let videoSocket = null;
+        let telemetrySocket = null;
+        const canvas = document.getElementById('video-canvas');
+        const ctx = canvas.getContext('2d');
+
+        const COLOR_MAP = {
+            'HUMAN': '#00ff80',
+            'ANIMAL': '#00d7ff',
+            'OBJECT': '#a855f7'
+        };
+
+        // Render input controls matching selected feed type
+        function renderSourceInputs() {
+            const type = document.getElementById('source-type').value;
+            const container = document.getElementById('dynamic-inputs');
+            container.innerHTML = '';
+
+            if (type === 'skydroid') {
+                container.innerHTML = `
+                    <select id="skydroid-preset" style="width: 220px;">
+                        <option value="rtsp://192.168.144.108:554/live/ch0">Skydroid H12/H16 (192.168.144.108:554/live/ch0)</option>
+                        <option value="rtsp://192.168.43.1:8554/fpv">Skydroid Hotspot (192.168.43.1:8554/fpv)</option>
+                        <option value="udp://127.0.0.1:12345">Skydroid UDP Relay (127.0.0.1:12345)</option>
+                    </select>
+                `;
+            } else if (type === 'rtmp') {
+                container.innerHTML = `
+                    <input type="text" id="stream-ip" placeholder="LAN IP" style="width: 105px;">
+                    <input type="number" id="stream-port" value="1935" style="width: 55px;">
+                    <input type="text" id="stream-path" value="live/drone1" style="width: 90px;">
+                `;
+                fetch('/api/system/info').then(r => r.json()).then(d => {
+                    const el = document.getElementById('stream-ip');
+                    if (el) el.value = d.ip;
+                });
+            } else if (type === 'rtsp') {
+                container.innerHTML = `
+                    <input type="text" id="rtsp-url" placeholder="rtsp://camera-ip:554/stream" style="width: 230px;">
+                `;
+            } else if (type === 'http') {
+                container.innerHTML = `
+                    <input type="text" id="http-url" placeholder="http://drone-ip:8080/stream.mjpg" style="width: 230px;">
+                `;
+            } else {
+                container.innerHTML = `
+                    <input type="text" id="custom-uri" placeholder="udp://@:14550 or rtmp://... or rtsp://..." style="width: 240px;">
+                `;
+            }
+        }
+
+        // --- Draggable Split Divider ---
+        const resizer = document.getElementById('drag-resizer');
+        const sidebar = document.getElementById('sidebar-pane');
+        let isDragging = false;
+
+        resizer.addEventListener('mousedown', () => {
+            isDragging = true;
+            resizer.classList.add('dragging');
+            document.body.style.cursor = 'col-resize';
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const newWidth = document.body.clientWidth - e.clientX;
+            if (newWidth >= 260 && newWidth <= 650) {
+                sidebar.style.width = `${newWidth}px`;
+                if (map) map.invalidateSize();
+            }
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (isDragging) {
+                isDragging = false;
+                resizer.classList.remove('dragging');
+                document.body.style.cursor = 'default';
+            }
+        });
+
+        // --- Top Aspect Ratio & Custom Crop Engine ---
+        function setRatioPreset(preset) {
+            document.querySelectorAll('.btn-crop-preset').forEach(b => b.classList.remove('active'));
+            if (event && event.target) event.target.classList.add('active');
+
+            if (preset === 'fill') {
+                canvas.style.setProperty('object-fit', 'fill', 'important');
+                canvas.style.setProperty('width', '100%', 'important');
+                canvas.style.setProperty('height', '100%', 'important');
+                canvas.style.aspectRatio = 'unset';
+            } else if (preset === 'cover') {
+                canvas.style.setProperty('object-fit', 'cover', 'important');
+                canvas.style.setProperty('width', '100%', 'important');
+                canvas.style.setProperty('height', '100%', 'important');
+                canvas.style.aspectRatio = 'unset';
+            } else if (preset === '16-9') {
+                canvas.style.setProperty('object-fit', 'fill', 'important');
+                canvas.style.setProperty('width', '100%', 'important');
+                canvas.style.setProperty('height', 'auto', 'important');
+                canvas.style.aspectRatio = '16 / 9';
+            } else if (preset === '4-3') {
+                canvas.style.setProperty('object-fit', 'fill', 'important');
+                canvas.style.setProperty('width', 'auto', 'important');
+                canvas.style.setProperty('height', '100%', 'important');
+                canvas.style.aspectRatio = '4 / 3';
+            } else if (preset === '9-16') {
+                canvas.style.setProperty('object-fit', 'fill', 'important');
+                canvas.style.setProperty('width', 'auto', 'important');
+                canvas.style.setProperty('height', '100%', 'important');
+                canvas.style.aspectRatio = '9 / 16';
+            } else if (preset === 'contain') {
+                canvas.style.setProperty('object-fit', 'contain', 'important');
+                canvas.style.setProperty('width', 'auto', 'important');
+                canvas.style.setProperty('height', 'auto', 'important');
+                canvas.style.aspectRatio = 'unset';
+            }
+            resetAdjustments();
+        }
+
+        function applyAdjustments() {
+            const zoom = parseFloat(document.getElementById('zoom-slider').value);
+            const stretch = parseFloat(document.getElementById('width-slider').value);
+            const scaleX = (zoom * (stretch / 100)).toFixed(2);
+            const scaleY = zoom.toFixed(2);
+            canvas.style.transform = `scale(${scaleX}, ${scaleY})`;
+        }
+
+        function resetAdjustments() {
+            document.getElementById('zoom-slider').value = 1.0;
+            document.getElementById('width-slider').value = 100;
+            canvas.style.transform = 'scale(1.0, 1.0)';
+        }
+
+        async function updateOrientation() {
+            currentRotation = parseInt(document.getElementById('feed-rotate').value);
+            document.getElementById('hud-banner').innerText = `VIEWPORT: CUSTOM | ${currentRotation}° ALIGNED`;
+            
+            await fetch('/api/stream/orientation', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ orientation: currentRotation })
+            });
+        }
+
+        async function initSystem() {
+            try {
+                renderSourceInputs();
+
+                const res = await fetch('/api/system/info');
+                const data = await res.json();
+
+                const ipInput = document.getElementById('stream-ip');
+                if (ipInput) ipInput.value = data.ip;
+
+                if (data.latitude && data.longitude) {
+                    currentLat = data.latitude;
+                    currentLon = data.longitude;
+                    document.getElementById('loc-text').innerText = `GPS (Network): ${currentLat.toFixed(5)}, ${currentLon.toFixed(5)}`;
+                }
+
+                map = L.map('map', { attributionControl: false }).setView([currentLat, currentLon], 17);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+                hostMarker = L.circleMarker([currentLat, currentLon], {
+                    radius: 8, color: '#38bdf8', fillColor: '#0284c7', fillOpacity: 0.9, weight: 2
+                }).addTo(map);
+
+                requestHighPrecisionGPS();
+                initTelemetrySocket();
+            } catch (err) {
+                console.error("Init error:", err);
+            }
+        }
+
+        async function changeCategoryFilter() {
+            const cat = document.getElementById('filter-category').value;
+            clearDetections();
+
+            await fetch('/api/stream/filter', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ category: cat })
+            });
+        }
+
+        function requestHighPrecisionGPS() {
+            if ("geolocation" in navigator) {
+                navigator.geolocation.getCurrentPosition(
+                    async (position) => {
+                        currentLat = position.coords.latitude;
+                        currentLon = position.coords.longitude;
+                        const accuracy = position.coords.accuracy;
+
+                        document.getElementById('loc-text').innerText = `GPS (±${accuracy.toFixed(0)}m): ${currentLat.toFixed(5)}, ${currentLon.toFixed(5)}`;
+
+                        if (map && hostMarker) {
+                            hostMarker.setLatLng([currentLat, currentLon]);
+                            map.panTo([currentLat, currentLon]);
+                        }
+
+                        await fetch('/api/system/location', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                latitude: currentLat,
+                                longitude: currentLon,
+                                accuracy: accuracy
+                            })
+                        });
+                    },
+                    (error) => {
+                        console.warn("Browser GPS blocked/unavailable, relying on network geolocation.");
+                    },
+                    { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+                );
+            }
+        }
+
+        function initTelemetrySocket() {
+            const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            telemetrySocket = new WebSocket(`${wsProto}//${location.host}/ws/telemetry`);
+
+            telemetrySocket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.type === 'detection' && Array.isArray(data.targets)) {
+                    updateDetections(data.targets);
+                }
+            };
+            telemetrySocket.onclose = () => setTimeout(initTelemetrySocket, 2000);
+        }
+
+        function connectVideoSocket() {
+            const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            videoSocket = new WebSocket(`${wsProto}//${location.host}/ws/video`);
+            videoSocket.binaryType = 'blob';
+
+            videoSocket.onmessage = async (event) => {
+                const bitmap = await createImageBitmap(event.data);
+                if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+                    canvas.width = bitmap.width;
+                    canvas.height = bitmap.height;
+                }
+                ctx.drawImage(bitmap, 0, 0);
+                bitmap.close();
+            };
+
+            videoSocket.onclose = () => {
+                if (isConnected) setTimeout(connectVideoSocket, 1000);
+            };
+        }
+
+        async function toggleStream() {
+            const btn = document.getElementById('btn-connect');
+            const placeholder = document.getElementById('video-placeholder');
+
+            if (!isConnected) {
+                const sourceType = document.getElementById('source-type').value;
+                let payload = { source_type: sourceType };
+
+                if (sourceType === 'skydroid') {
+                    payload.url = document.getElementById('skydroid-preset').value;
+                } else if (sourceType === 'rtmp') {
+                    payload.ip = document.getElementById('stream-ip').value.trim();
+                    payload.port = parseInt(document.getElementById('stream-port').value.trim());
+                    payload.path = document.getElementById('stream-path').value.trim();
+                } else if (sourceType === 'rtsp') {
+                    payload.url = document.getElementById('rtsp-url').value.trim();
+                } else if (sourceType === 'http') {
+                    payload.url = document.getElementById('http-url').value.trim();
+                } else {
+                    payload.url = document.getElementById('custom-uri').value.trim();
+                }
+
+                const res = await fetch('/api/stream/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (res.ok) {
+                    btn.innerText = "Disconnect";
+                    btn.classList.add("disconnect");
+                    isConnected = true;
+                    placeholder.style.display = 'none';
+                    canvas.style.display = 'block';
+                    connectVideoSocket();
+                }
+            } else {
+                await fetch('/api/stream/disconnect', { method: 'POST' });
+                btn.innerText = "Connect";
+                btn.classList.remove("disconnect");
+                isConnected = false;
+
+                if (videoSocket) {
+                    videoSocket.close();
+                    videoSocket = null;
+                }
+                canvas.style.display = 'none';
+                placeholder.style.display = 'block';
+                clearDetections();
+                resetRecordingUI(); // server auto-stops any active recording on disconnect
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Recording controls -- records the DETECTED (annotated) feed only.
+        // -----------------------------------------------------------------
+        function resetRecordingUI() {
+            document.getElementById('btn-record-start').disabled = false;
+            document.getElementById('btn-record-start').style.display = 'inline-block';
+            document.getElementById('btn-record-pause').disabled = true;
+            document.getElementById('btn-record-pause').style.display = 'inline-block';
+            document.getElementById('btn-record-resume').disabled = true;
+            document.getElementById('btn-record-resume').style.display = 'none';
+            document.getElementById('btn-record-stop').disabled = true;
+            document.getElementById('record-status').innerText = 'Not recording';
+        }
+
+        async function startRecording() {
+            if (!isConnected) {
+                document.getElementById('record-status').innerText = 'Connect a stream first.';
+                return;
+            }
+            const saveDir = document.getElementById('record-save-dir').value.trim();
+            const res = await fetch('/api/record/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ save_dir: saveDir })
+            });
+            const data = await res.json();
+            if (data.status === 'RECORDING') {
+                document.getElementById('btn-record-start').disabled = true;
+                document.getElementById('btn-record-pause').disabled = false;
+                document.getElementById('btn-record-stop').disabled = false;
+                document.getElementById('record-status').innerText = `● Recording -> ${data.filepath}`;
+            } else {
+                document.getElementById('record-status').innerText = data.message || 'Could not start recording.';
+            }
+        }
+
+        async function pauseRecording() {
+            const res = await fetch('/api/record/pause', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'PAUSED') {
+                document.getElementById('btn-record-pause').style.display = 'none';
+                document.getElementById('btn-record-resume').style.display = 'inline-block';
+                document.getElementById('btn-record-resume').disabled = false;
+                document.getElementById('record-status').innerText = `⏸ Paused -> ${data.filepath}`;
+            }
+        }
+
+        async function resumeRecording() {
+            const res = await fetch('/api/record/resume', { method: 'POST' });
+            const data = await res.json();
+            if (data.status === 'RECORDING') {
+                document.getElementById('btn-record-resume').style.display = 'none';
+                document.getElementById('btn-record-pause').style.display = 'inline-block';
+                document.getElementById('btn-record-pause').disabled = false;
+                document.getElementById('record-status').innerText = `● Recording -> ${data.filepath}`;
+            }
+        }
+
+        async function stopRecording() {
+            const res = await fetch('/api/record/stop', { method: 'POST' });
+            const data = await res.json();
+            resetRecordingUI();
+            if (data.status === 'STOPPED') {
+                document.getElementById('record-status').innerText = `Saved: ${data.filepath}`;
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Target lock -- upload a reference image, narrow detection down to
+        // that specific target only.
+        // -----------------------------------------------------------------
+        async function setTargetLock() {
+            const input = document.getElementById('target-image-input');
+            const statusEl = document.getElementById('target-lock-status');
+            if (!input.files || input.files.length === 0) {
+                statusEl.innerText = 'Choose an image first.';
+                return;
+            }
+            statusEl.innerText = 'Analyzing reference image...';
+            const formData = new FormData();
+            formData.append('file', input.files[0]);
+
+            const res = await fetch('/api/target/set', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (data.status === 'TARGET_LOCKED') {
+                statusEl.innerText = `LOCKED: ${data.label}`;
+                statusEl.style.color = '#22d3ee';
+            } else {
+                statusEl.innerText = data.message || 'Could not lock target.';
+                statusEl.style.color = '#f87171';
+            }
+        }
+
+        async function clearTargetLock() {
+            await fetch('/api/target/clear', { method: 'POST' });
+            const statusEl = document.getElementById('target-lock-status');
+            statusEl.innerText = 'Inactive';
+            statusEl.style.color = '#94a3b8';
+            document.getElementById('target-image-input').value = '';
+        }
+
+        function clearDetections() {
+            markers.forEach(m => map.removeLayer(m));
+            markers = [];
+            document.getElementById('targets-list').innerHTML = '';
+            document.getElementById('target-count').innerText = "0 Visible";
+            document.getElementById('count-humans').innerText = "0";
+            document.getElementById('count-animals').innerText = "0";
+            document.getElementById('count-objects').innerText = "0";
+        }
+
+        function updateDetections(targets) {
+            markers.forEach(m => map.removeLayer(m));
+            markers = [];
+
+            const list = document.getElementById('targets-list');
+            list.innerHTML = '';
+            document.getElementById('target-count').innerText = `${targets.length} Visible`;
+
+            let humanCount = 0, animalCount = 0, objectCount = 0;
+
+            targets.forEach(t => {
+                const cat = t.category || 'OBJECT';
+
+                if (cat === 'HUMAN') humanCount++;
+                else if (cat === 'ANIMAL') animalCount++;
+                else objectCount++;
+
+                const markerColor = COLOR_MAP[cat] || '#a855f7';
+
+                const m = L.circleMarker([t.latitude, t.longitude], {
+                    radius: 7, color: markerColor, fillColor: markerColor, fillOpacity: 0.8
+                }).addTo(map).bindPopup(`<b>${t.class_name}</b><br>Category: ${cat}<br>Conf: ${parseInt(t.confidence * 100)}%`);
+                markers.push(m);
+
+                let cardClass = 'object';
+                let tagClass = 'tag-object';
+
+                if (cat === 'HUMAN') {
+                    cardClass = 'human';
+                    tagClass = 'tag-human';
+                } else if (cat === 'ANIMAL') {
+                    cardClass = 'animal';
+                    tagClass = 'tag-animal';
+                }
+
+                const item = document.createElement('div');
+                item.className = `target-card ${cardClass}`;
+                item.innerHTML = `
+                    <div class="target-meta">
+                        <div>
+                            <span class="cat-tag ${tagClass}">${cat}</span>
+                            <strong>${t.class_name}</strong>
+                        </div>
+                        <span class="target-coords">${t.latitude.toFixed(5)}, ${t.longitude.toFixed(5)}</span>
+                    </div>
+                    <span class="target-conf" style="color:${markerColor}">${parseInt(t.confidence * 100)}%</span>
+                `;
+                list.appendChild(item);
+            });
+
+            document.getElementById('count-humans').innerText = humanCount;
+            document.getElementById('count-animals').innerText = animalCount;
+            document.getElementById('count-objects').innerText = objectCount;
+        }
+
+        window.onload = initSystem;
+    </script>
+</body>
+</html>

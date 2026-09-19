@@ -1,0 +1,1736 @@
+===========================================
+DECS PROJECT AUDIT & CODEBASE ANALYSIS
+===========================================
+
+TOTAL ACTIVE FILES: 30
+
+[FILE STRUCTURE TREE]
+  - .\PROJECT_AUDIT.txt
+  - .\ai_analytics\detector.py
+  - .\api\__init__.py
+  - .\api\alert_consumer.py
+  - .\api\main.py
+  - .\api\websocket_manager.py
+  - .\auth_module\auth.py
+  - .\config_module\settings.py
+  - .\database_module\__init__.py
+  - .\database_module\detection_repository.py
+  - .\database_module\models.py
+  - .\database_module\session.py
+  - .\docker-compose.dev.yml
+  - .\drone_ingestion\detection_utils.py
+  - .\drone_ingestion\rtmp_reader.py
+  - .\frontend\index.html
+  - .\logging_module\logger.py
+  - .\message_broker\redis_producer.py
+  - .\pytest.ini
+  - .\requirements.txt
+  - .\tests\conftest.py
+  - .\tests\test_phase1.py
+  - .\tests\test_phase2.py
+  - .\tests\test_phase3.py
+  - .\tests\test_phase4.py
+  - .\weights\clip\ViT-B-32.pt
+  - .\yolo12n.pt
+  - .\yolo26n.pt
+  - .\yolov8n.pt
+  - .\yolov8s-worldv2.pt
+
+==================================================
+[COMPLETE FILE CONTENTS]
+==================================================
+
+
+--- FILE: .\docker-compose.dev.yml ---
+
+version: "3.9"
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: decs
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+
+--- FILE: .\requirements.txt ---
+
+fastapi==0.140.0
+mss==10.2.0
+numpy==2.5.1
+opencv_python==4.10.0.84
+pydantic==2.13.4
+pydantic_settings==2.14.2
+pygetwindow==0.0.9
+PyJWT==2.13.0
+pytest==9.1.1
+pytest_asyncio==1.4.0
+redis==8.0.1
+SQLAlchemy==2.0.51
+structlog==26.1.0
+testcontainers==4.15.0
+ultralytics==8.4.106
+win32gui==221.6
+
+
+--- FILE: .\ai_analytics\detector.py ---
+
+# ai_analytics/detector.py
+import math
+import cv2
+from ultralytics import YOLO
+from logging_module.logger import get_logger
+
+logger = get_logger("ai_detector")
+
+class TargetDetector:
+    def __init__(self, confidence_threshold: float = 0.4):
+        self.confidence_threshold = confidence_threshold
+        # Load lightweight nano model (downloads automatically on first run)
+        self.model = YOLO("yolov8n.pt")
+
+    def process_frame(self, frame_bgr, frame_metadata: dict, telemetry: dict) -> list:
+        """
+        Runs real YOLO model on the live frame and calculates geo-coordinates.
+        """
+        results = self.model(frame_bgr, verbose=False)[0]
+        detections = []
+
+        for box in results.boxes:
+            conf = float(box.conf[0])
+            if conf >= self.confidence_threshold:
+                cls_id = int(box.cls[0])
+                class_name = self.model.names[cls_id]
+                xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
+
+                target_geo = self._calculate_target_coordinates(
+                    drone_lat=telemetry.get("lat", 0.0),
+                    drone_lon=telemetry.get("lon", 0.0),
+                    alt=telemetry.get("alt", 50.0),
+                    heading=telemetry.get("heading", 0.0)
+                )
+
+                detections.append({
+                    "class_name": class_name,
+                    "confidence": round(conf, 2),
+                    "bbox": xyxy,
+                    "latitude": target_geo["lat"],
+                    "longitude": target_geo["lon"]
+                })
+
+        return detections
+
+    def _calculate_target_coordinates(self, drone_lat: float, drone_lon: float, alt: float, heading: float) -> dict:
+        earth_radius = 6378137.0
+        offset_meters = alt * math.tan(math.radians(15))
+        bearing = math.radians(heading)
+        
+        d_lat = (offset_meters * math.cos(bearing)) / earth_radius
+        d_lon = (offset_meters * math.sin(bearing)) / (earth_radius * math.cos(math.radians(drone_lat)))
+
+        return {
+            "lat": drone_lat + math.degrees(d_lat),
+            "lon": drone_lon + math.degrees(d_lon)
+        }
+
+--- FILE: .\api\alert_consumer.py ---
+
+import asyncio
+import json
+import aio_pika
+import structlog
+
+logger = structlog.get_logger()
+
+RABBITMQ_URL = "amqp://guest:guest@localhost:5672/"
+RABBITMQ_QUEUE = "alerts_queue"
+
+
+async def process_alert(message: aio_pika.IncomingMessage):
+    async with message.process():
+        alert_data = json.loads(message.body.decode())
+        
+        # Renamed keyword parameter from event to alert_event to avoid structlog key collision
+        logger.warning(
+            "🚨 CRITICAL ALERT DISPATCHED 🚨",
+            alert_event=alert_data.get("event"),
+            target=alert_data.get("class"),
+            confidence=f"{int(alert_data.get('confidence', 0) * 100)}%",
+            lat=alert_data.get("latitude"),
+            lon=alert_data.get("longitude")
+        )
+        
+        target_name = alert_data.get("class", "UNKNOWN").upper()
+        lat = alert_data.get("latitude")
+        lon = alert_data.get("longitude")
+        print(f"\n[ALERT WORKER] -> ACTION REQUIRED: High confidence {target_name} identified at LAT: {lat}, LON: {lon}\n")
+
+
+async def main():
+    logger.info("starting_rabbitmq_alert_consumer_worker")
+    connection = await aio_pika.connect_robust(RABBITMQ_URL)
+    
+    async with connection:
+        channel = await connection.channel()
+        await channel.set_qos(prefetch_count=1)
+        queue = await channel.declare_queue(RABBITMQ_QUEUE, durable=True)
+        
+        logger.info("listening_for_threat_alerts_on_rabbitmq", queue=RABBITMQ_QUEUE)
+        
+        await queue.consume(process_alert)
+        await asyncio.Future()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("alert_consumer_worker_stopped")
+
+--- FILE: .\api\main.py ---
+
+import os
+import json
+import socket
+from datetime import datetime
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+
+# Database imports
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import String, Float, DateTime, select, func
+
+# =====================================================================
+# 1. DATABASE & LIFESPAN MANAGEMENT (WITH SAFE FALLBACK)
+# =====================================================================
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/decs_db")
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+DB_ONLINE = False
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class DetectionLog(Base):
+    __tablename__ = "detection_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    class_name: Mapped[str] = mapped_column(String(50))
+    confidence: Mapped[float] = mapped_column(Float)
+    latitude: Mapped[float] = mapped_column(Float)
+    longitude: Mapped[float] = mapped_column(Float)
+    engine: Mapped[str] = mapped_column(String(50), default="YOLOv8")
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global DB_ONLINE
+    print("[INFO] Starting DECS Core API Engine...")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        DB_ONLINE = True
+        print("[SUCCESS] Connected to PostGIS / PostgreSQL Database on Port 5432.")
+    except Exception as e:
+        DB_ONLINE = False
+        print("\n" + "="*70)
+        print("[WARNING] Could not connect to PostgreSQL on port 5432.")
+        print("[NOTICE] Continuing in MEMORY-ONLY mode. Live WebSockets & C2 controls are operational!")
+        print("="*70 + "\n")
+    yield
+    print("[INFO] Shutting down DECS Core API Engine...")
+
+
+app = FastAPI(title="DECS - Drone Detection Engine & C2 Platform", lifespan=lifespan)
+
+# Mount frontend directory for static assets
+if os.path.exists("frontend"):
+    app.mount("/static", StaticFiles(directory="frontend"), name="static")
+
+
+# =====================================================================
+# 2. WEBSOCKET CONNECTION MANAGER (C2 BROADCASTER)
+# =====================================================================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        print(f"[C2 SOCKET] Client connected. Total active links: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            print(f"[C2 SOCKET] Client disconnected. Active links remaining: {len(self.active_connections)}")
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception:
+                pass
+
+
+manager = ConnectionManager()
+
+
+# =====================================================================
+# 3. HELPER FUNCTIONS & ROUTING
+# =====================================================================
+def get_local_ip():
+    """Dynamically fetches your PC's local network IP."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = "127.0.0.1"
+    finally:
+        s.close()
+    return ip
+
+
+@app.get("/")
+async def get_dashboard():
+    """Serves the Tactical C2 Dashboard frontend."""
+    if os.path.exists("frontend/index.html"):
+        return FileResponse("frontend/index.html")
+    return JSONResponse({"status": "DECS API Online", "dashboard": "frontend/index.html missing"})
+
+
+@app.get("/api/stream/generate-rtmp")
+async def generate_rtmp_url(stream_id: str = "drone_alpha"):
+    """
+    Generates the RTMP Target URL to enter into the DJI Fly App.
+    """
+    server_ip = get_local_ip()
+    rtmp_url = f"rtmp://{server_ip}:1935/live/{stream_id}"
+    
+    return {
+        "status": "active",
+        "stream_id": stream_id,
+        "rtmp_url": rtmp_url,
+        "instructions": f"Enter '{rtmp_url}' into DJI Fly App -> Settings -> Transmission -> RTMP"
+    }
+
+
+@app.websocket("/ws/telemetry")
+async def websocket_telemetry(websocket: WebSocket):
+    """
+    Bi-directional communication channel:
+    - Receives telemetry targets from reader scripts and routes them to C2 UI
+    - Receives Admin config commands from C2 UI and broadcasts them
+    """
+    await manager.connect(websocket)
+    try:
+        while True:
+            data_str = await websocket.receive_text()
+            data = json.loads(data_str)
+
+            # Route 1: Target Detection Payload
+            if data.get("type") == "detection":
+                targets = data.get("targets", [])
+                
+                # Save to DB if PostGIS is online
+                if DB_ONLINE and targets:
+                    async with AsyncSessionLocal() as session:
+                        for t in targets:
+                            log = DetectionLog(
+                                class_name=t.get("class_name", "unknown"),
+                                confidence=t.get("confidence", 0.0),
+                                latitude=t.get("latitude", 0.0),
+                                longitude=t.get("longitude", 0.0),
+                                engine=t.get("engine", "C2")
+                            )
+                            session.add(log)
+                        await session.commit()
+
+                # Broadcast live detections to all connected C2 Dashboards
+                await manager.broadcast(data_str)
+
+            # Route 2: Admin Config Overrides from Frontend
+            elif data.get("type") == "admin_config":
+                print(f"[ADMIN C2 OVERRIDE] Broadcasted engine parameters: {data}")
+                await manager.broadcast(data_str)
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        print(f"[SOCKET ERROR] {e}")
+        manager.disconnect(websocket)
+
+
+@app.get("/api/detections/history")
+async def get_detection_history(
+    min_confidence: float = Query(0.4, ge=0.0, le=1.0),
+    target_class: Optional[str] = None
+):
+    """Queries historical telemetry logs from PostGIS if connected."""
+    if not DB_ONLINE:
+        return JSONResponse({"status": "offline", "message": "PostgreSQL offline. Running in live telemetry-only mode."})
+
+    async with AsyncSessionLocal() as session:
+        query = select(DetectionLog).where(DetectionLog.confidence >= min_confidence)
+        if target_class:
+            query = query.where(func.lower(DetectionLog.class_name) == target_class.lower())
+        
+        query = query.order_by(DetectionLog.timestamp.desc()).limit(50)
+        result = await session.execute(query)
+        logs = result.scalars().all()
+
+        return [
+            {
+                "id": log.id,
+                "class_name": log.class_name,
+                "confidence": log.confidence,
+                "latitude": log.latitude,
+                "longitude": log.longitude,
+                "engine": log.engine,
+                "timestamp": log.timestamp.isoformat()
+            }
+            for log in logs
+        ]
+
+--- FILE: .\api\websocket_manager.py ---
+
+# api/websocket_manager.py
+from fastapi import WebSocket
+from typing import List
+import json
+from logging_module.logger import get_logger
+
+logger = get_logger("websocket_manager")
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info("websocket_client_connected", total_connections=len(self.active_connections))
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            logger.info("websocket_client_disconnected", total_connections=len(self.active_connections))
+
+    async def broadcast_telemetry(self, drone_id: str, payload: dict):
+        """Broadcasts live MAVLink telemetry to all connected clients."""
+        message = json.dumps({"type": "telemetry", "drone_id": drone_id, "data": payload})
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_text(message)
+            except Exception as e:
+                logger.error("error_broadcasting_telemetry", error=str(e))
+
+    async def broadcast_detection(self, stream_id: str, detections: list):
+        """Broadcasts live AI detections from scrcpy/RTSP to all connected clients."""
+        message = json.dumps({"type": "detection", "stream_id": stream_id, "targets": detections})
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_text(message)
+            except Exception as e:
+                logger.error("error_broadcasting_detection", error=str(e))
+
+ws_manager = ConnectionManager()
+
+--- FILE: .\api\__init__.py ---
+
+
+
+--- FILE: .\auth_module\auth.py ---
+
+# auth_module/auth.py
+from datetime import datetime, timedelta, timezone
+import jwt
+from fastapi import HTTPException, Security, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from config_module.settings import settings
+
+security = HTTPBearer()
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+def require_role(required_role: str):
+    def role_dependency(credentials: HTTPAuthorizationCredentials = Security(security)):
+        payload = decode_token(credentials.credentials)
+        user_role = payload.get("role")
+        if user_role != required_role and user_role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions for this operation",
+            )
+        return payload
+    return role_dependency
+
+--- FILE: .\config_module\settings.py ---
+
+# config_module/settings.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+class Settings(BaseSettings):
+    # App Settings
+    APP_NAME: str = "DECS Core Engine"
+    ENVIRONMENT: str = "development"
+    LOG_LEVEL: str = "INFO"
+
+    # Security & Auth (Module 20)
+    SECRET_KEY: str = Field(default="dev_secret_key_change_in_production_123456789")
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 1 day
+
+    # Database (Module 18)
+    POSTGRES_USER: str = "postgres"
+    POSTGRES_PASSWORD: str = "devpassword"
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    POSTGRES_DB: str = "decs"
+
+    @property
+    def DATABASE_URL(self) -> str:
+        return f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+
+    # Redis & Message Broker
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+settings = Settings()
+
+--- FILE: .\database_module\detection_repository.py ---
+
+# database_module/detection_repository.py
+from sqlalchemy.ext.asyncio import AsyncSession
+from geoalchemy2.shape import from_shape
+from shapely.geometry import Point
+from database_module.models import DetectionLog
+from database_module.session import AsyncSessionLocal
+from logging_module.logger import get_logger
+
+logger = get_logger("detection_repository")
+
+async def log_detections_to_db(stream_id: str, detections: list):
+    """
+    Asynchronously persists target detection events into PostGIS.
+    """
+    if not detections:
+        return
+
+    async with AsyncSessionLocal() as session:
+        try:
+            for det in detections:
+                lat = det.get("latitude")
+                lon = det.get("longitude")
+                
+                # Create Spatial Point geometry for PostGIS
+                point = Point(lon, lat)
+                spatial_geom = from_shape(point, srid=4326)
+
+                log_entry = DetectionLog(
+                    stream_id=stream_id,
+                    class_name=det.get("class_name"),
+                    confidence=det.get("confidence"),
+                    latitude=lat,
+                    longitude=lon,
+                    location=spatial_geom
+                )
+                session.add(log_entry)
+
+            await session.commit()
+            logger.info("detections_logged_to_postgis", count=len(detections))
+        except Exception as e:
+            await session.rollback()
+            logger.error("failed_to_log_detections", error=str(e))
+
+--- FILE: .\database_module\models.py ---
+
+# database_module/models.py
+from datetime import datetime, timezone
+from sqlalchemy import Column, Integer, String, Float, DateTime
+from geoalchemy2 import Geometry
+from database_module.session import Base
+
+class DetectionLog(Base):
+    __tablename__ = "detection_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    stream_id = Column(String, index=True)
+    class_name = Column(String, index=True)
+    confidence = Column(Float)
+    
+    # Raw Coordinates
+    latitude = Column(Float)
+    longitude = Column(Float)
+    
+    # PostGIS Spatial Point (SRID 4326 = WGS 84 GPS standard)
+    location = Column(Geometry(geometry_type='POINT', srid=4326))
+    
+    # Enable timezone=True so PostgreSQL handles UTC timestamps properly
+    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+--- FILE: .\database_module\session.py ---
+
+# database_module/session.py
+import os
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+
+# PostgreSQL / PostGIS async connection string
+# Defaults to localhost PostgreSQL database "decs_db"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "postgresql+asyncpg://postgres:postgres@localhost:5432/decs_db"
+)
+
+engine = create_async_engine(DATABASE_URL, echo=False, future=True)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False
+)
+
+Base = declarative_base()
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+--- FILE: .\database_module\__init__.py ---
+
+
+
+--- FILE: .\drone_ingestion\detection_utils.py ---
+
+"""
+DECS - Shared Detection Utilities (Pure RTMP Ingestion)
+===========================================================
+Handles thread-safe image processing, dynamic color hashing,
+multi-engine Non-Maximum Suppression (NMS), and telemetry packaging.
+"""
+
+import cv2
+import numpy as np
+import zlib
+
+# C2 Telemetry Configuration
+WS_URL = "ws://localhost:8000/ws/telemetry"
+LAPTOP_IP = "192.168.205.204"
+RTMP_URL = f"rtmp://{LAPTOP_IP}:1935/live/drone1"
+
+# Geolocation Baseline Settings
+BASE_LAT = 17.0253
+BASE_LON = 81.7779
+
+# Open-Vocabulary Target Classes
+BROAD_CLASSES = [
+    "house", "building", "apartment building", "roof", "bridge",
+    "river", "lake", "flood water", "road", "tree", "forest",
+    "field", "car", "bus", "truck", "boat", "person", "animal",
+    "cow", "dog", "debris", "collapsed structure", "power line",
+    "tent", "smoke", "fire"
+]
+
+# Engine Execution Defaults
+ADMIN_CONFIG = {
+    "engine_mode": "MILITARY_SPEC",   # MILITARY_SPEC | FAST_ONLY | BROAD_ONLY
+    "min_confidence": 0.35,
+    "max_area_pct": 60.0,
+    "clahe_enabled": True,
+    "broad_engine_every_n_frames": 3,
+}
+
+WINDOW_NAME = "DECS - Live Target Tracking"
+
+
+def get_class_color(class_name: str):
+    """Generates a deterministic, high-contrast BGR color based on class string."""
+    hash_val = zlib.crc32(class_name.lower().encode('utf-8'))
+    b = (hash_val & 0xFF)
+    g = ((hash_val >> 8) & 0xFF)
+    r = ((hash_val >> 16) & 0xFF)
+    
+    max_val = max(r, g, b)
+    if max_val < 130:
+        r = min(255, r + 100)
+        g = min(255, g + 100)
+        b = min(255, b + 100)
+        
+    return (int(b), int(g), int(r))
+
+
+def setup_display_window(window_name=WINDOW_NAME):
+    """Configures a resizable OpenCV GUI window that retains aspect ratio."""
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+
+
+def get_frame_orientation(frame):
+    """Calculates live frame dimensions, orientation mode, and aspect ratio."""
+    h, w = frame.shape[0], frame.shape[1]
+    orientation = "portrait" if h > w else "landscape"
+    ratio = f"{w}:{h}"
+    return {"width": w, "height": h, "orientation": orientation, "aspect_ratio": ratio}
+
+
+def resize_for_display(frame, target_height=720):
+    """Scales display frame height cleanly without breaking aspect ratio."""
+    h, w = frame.shape[0], frame.shape[1]
+    if h == 0 or w == 0:
+        return frame
+    scale = target_height / float(h)
+    new_w = int(w * scale)
+    return cv2.resize(frame, (new_w, target_height), interpolation=cv2.INTER_LINEAR)
+
+
+def apply_clahe(frame):
+    """Applies local CLAHE contrast enhancement for dark or high-exposure streams."""
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def non_max_suppression_fast(boxes, overlap_thresh=0.45):
+    """Combines predictions across FAST and BROAD AI engines using standard NMS."""
+    if not boxes:
+        return []
+    arr = np.array([[b['x1'], b['y1'], b['x2'], b['y2'], b['confidence']] for b in boxes])
+    x1, y1, x2, y2, scores = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4]
+    area = (x2 - x1 + 1) * (y2 - y1 + 1)
+    idxs = np.argsort(scores)
+    pick = []
+    
+    while len(idxs) > 0:
+        last = len(idxs) - 1
+        i = idxs[last]
+        pick.append(i)
+        xx1 = np.maximum(x1[i], x1[idxs[:last]])
+        yy1 = np.maximum(y1[i], y1[idxs[:last]])
+        xx2 = np.minimum(x2[i], x2[idxs[:last]])
+        yy2 = np.minimum(y2[i], y2[idxs[:last]])
+        w = np.maximum(0, xx2 - xx1 + 1)
+        h = np.maximum(0, yy2 - yy1 + 1)
+        overlap = (w * h) / area[idxs[:last]]
+        idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlap_thresh)[0])))
+        
+    return [boxes[p] for p in pick]
+
+
+def run_fast_engine(model_fast, frame, min_conf):
+    """Executes primary COCO object detection model."""
+    dets = []
+    res = model_fast(frame, verbose=False)[0]
+    for box in res.boxes:
+        conf = float(box.conf[0])
+        if conf >= min_conf:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls_name = model_fast.names[int(box.cls[0])].lower()
+            dets.append({
+                "class_name": cls_name, "confidence": conf,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2, "engine": "FAST"
+            })
+    return dets
+
+
+def run_broad_engine(model_broad, frame, min_conf):
+    """Executes open-vocabulary detection model."""
+    dets = []
+    res = model_broad(frame, verbose=False)[0]
+    for box in res.boxes:
+        conf = float(box.conf[0])
+        if conf >= min_conf:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls_id = int(box.cls[0])
+            cls_name = BROAD_CLASSES[cls_id].lower() if cls_id < len(BROAD_CLASSES) else "object"
+            dets.append({
+                "class_name": cls_name, "confidence": conf,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2, "engine": "BROAD"
+            })
+    return dets
+
+
+def draw_and_package(frame, final_targets):
+    """Draws scalable visual detection targets and structures backend telemetry."""
+    telemetry_payload = []
+    h, w, _ = frame.shape
+    font_scale = max(0.65, min(w, h) / 900.0)
+    thickness = max(2, int(font_scale * 2.5))
+    
+    for item in final_targets:
+        x1, y1, x2, y2 = item['x1'], item['y1'], item['x2'], item['y2']
+        cls_name = item['class_name'].upper()
+        conf = item['confidence']
+        color = get_class_color(item['class_name'])
+        
+        # Target Bounding Box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness + 1)
+        
+        # Label Typography Backdrop
+        label_text = f"{cls_name} {conf:.2f}"
+        (text_w, text_h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        
+        label_y1 = max(y1 - text_h - 10, 0)
+        label_y2 = max(y1, text_h + 10)
+        cv2.rectangle(frame, (x1, label_y1), (x1 + text_w + 10, label_y2), color, -1)
+        cv2.putText(frame, label_text, (x1 + 5, label_y2 - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
+        
+        telemetry_payload.append({
+            "class_name": item['class_name'],
+            "confidence": round(conf, 2),
+            "latitude": BASE_LAT,
+            "longitude": BASE_LON,
+            "engine": item['engine']
+        })
+        
+    return telemetry_payload
+
+
+def draw_osd(frame, mode, min_conf, frame_meta=None):
+    """Draws upper status HUD bar."""
+    text = f"MODE: {mode} | CONF: {min_conf:.2f}"
+    if frame_meta:
+        text += f" | {frame_meta['width']}x{frame_meta['height']} ({frame_meta['orientation'].upper()})"
+        
+    h, w, _ = frame.shape
+    banner_height = int(max(40, h * 0.05))
+    
+    cv2.rectangle(frame, (0, 0), (w, banner_height), (15, 23, 42), -1)
+    cv2.putText(frame, text, (15, int(banner_height * 0.7)),
+                cv2.FONT_HERSHEY_SIMPLEX, max(0.5, banner_height / 80.0), (56, 189, 248), 2)
+
+--- FILE: .\drone_ingestion\rtmp_reader.py ---
+
+"""
+DECS - Stream Ingestion & Telemetry Dispatcher (RTMP Only)
+============================================================
+Handles threaded frame consumption directly from MediaMTX, 
+asynchronous inference execution, dynamic display rendering,
+and WebSocket fallback telemetry routing.
+"""
+
+import cv2
+import json
+import time
+import asyncio
+import threading
+from queue import Queue
+from concurrent.futures import ThreadPoolExecutor
+import websockets
+from ultralytics import YOLO
+
+from detection_utils import (
+    RTMP_URL, WS_URL, ADMIN_CONFIG, BROAD_CLASSES,
+    apply_clahe, non_max_suppression_fast,
+    run_fast_engine, run_broad_engine,
+    draw_and_package, draw_osd,
+    get_frame_orientation, resize_for_display, setup_display_window
+)
+
+print(f"[INFO] Initializing MediaMTX Target Stream: {RTMP_URL}")
+print("[INFO] Loading FAST Detection Model (yolov8n.pt)...")
+model_fast = YOLO("yolov8n.pt")
+
+print("[INFO] Loading BROAD Detection Model (yolov8s-worldv2.pt)...")
+model_broad = YOLO("yolov8s-worldv2.pt")
+model_broad.set_classes(BROAD_CLASSES)
+
+executor = ThreadPoolExecutor(max_workers=2)
+
+
+class NonBlockingRTMPReader:
+    """Thread-safe frame buffer that reads continuously from MediaMTX."""
+    def __init__(self, rtmp_src):
+        self.rtmp_src = rtmp_src
+        self.cap = None
+        self.q = Queue(maxsize=2)
+        self.running = True
+        self.connected = False
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
+
+    def _connect(self):
+        print(f"[INFO] Connecting to RTMP stream: {self.rtmp_src}")
+        while self.running:
+            self.cap = cv2.VideoCapture(self.rtmp_src, cv2.CAP_FFMPEG)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if self.cap.isOpened():
+                ret, _ = self.cap.read()
+                if ret:
+                    print("[SUCCESS] Live RTMP video feed acquired.")
+                    self.connected = True
+                    return
+            if self.cap:
+                self.cap.release()
+            print("[WAITING] MediaMTX stream offline. Retrying in 2 seconds...")
+            time.sleep(2)
+
+    def _update(self):
+        self._connect()
+        while self.running:
+            if not self.cap or not self.cap.isOpened():
+                self.connected = False
+                self._connect()
+                continue
+            ret, frame = self.cap.read()
+            if not ret:
+                print("[WARN] Video stream dropped. Reconnecting...")
+                self.connected = False
+                self.cap.release()
+                time.sleep(1)
+                self._connect()
+                continue
+            
+            # Clear old queue elements to enforce zero frame buffer lag
+            if not self.q.empty():
+                try:
+                    self.q.get_nowait()
+                except Exception:
+                    pass
+            self.q.put(frame)
+
+    def read(self):
+        return self.q.get() if not self.q.empty() else None
+
+    def stop(self):
+        self.running = False
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+
+
+async def receive_admin_commands(websocket):
+    """Receives dynamically pushed C2 control parameters."""
+    global ADMIN_CONFIG
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            if data.get("type") == "admin_config":
+                for k in ("engine_mode", "min_confidence", "max_area_pct", "clahe_enabled"):
+                    if k in data:
+                        ADMIN_CONFIG[k] = data[k]
+                print(f"[C2 CONFIG UPDATE] -> {ADMIN_CONFIG}")
+    except Exception:
+        pass
+
+
+async def run_pipeline():
+    reader = NonBlockingRTMPReader(RTMP_URL)
+    frame_count = 0
+    last_orientation = None
+
+    window_title = "DECS - Live Target Tracking (RTMP)"
+    setup_display_window(window_title)
+
+    websocket = None
+    # Resilient connection to C2 WebSocket Telemetry Server
+    try:
+        websocket = await asyncio.wait_for(websockets.connect(WS_URL), timeout=2.0)
+        print(f"[INFO] Telemetry pipeline connected to server: {WS_URL}")
+        asyncio.create_task(receive_admin_commands(websocket))
+    except Exception as ws_err:
+        print(f"[WARN] C2 Telemetry Server offline ({ws_err}). Pipeline running in local display mode.")
+
+    try:
+        while True:
+            frame = reader.read()
+            if frame is None:
+                await asyncio.sleep(0.005)
+                continue
+
+            frame_count += 1
+            mode = ADMIN_CONFIG["engine_mode"]
+            min_conf = ADMIN_CONFIG["min_confidence"]
+            max_area_px = (ADMIN_CONFIG["max_area_pct"] / 100.0) * (frame.shape[0] * frame.shape[1])
+            working_frame = apply_clahe(frame) if ADMIN_CONFIG["clahe_enabled"] else frame
+
+            # Monitor dynamic video aspect ratios
+            frame_meta = get_frame_orientation(frame)
+            if frame_meta["orientation"] != last_orientation:
+                print(f"[INFO] Stream Aspect Shift: {frame_meta['orientation']} ({frame_meta['width']}x{frame_meta['height']})")
+                last_orientation = frame_meta["orientation"]
+
+            # Asynchronous inference execution across pools
+            loop = asyncio.get_event_loop()
+            futures = []
+            run_fast = mode in ("MILITARY_SPEC", "FAST_ONLY")
+            run_broad = mode in ("MILITARY_SPEC", "BROAD_ONLY") and \
+                (frame_count % ADMIN_CONFIG["broad_engine_every_n_frames"] == 0)
+
+            if run_fast:
+                futures.append(loop.run_in_executor(executor, run_fast_engine, model_fast, working_frame, min_conf))
+            if run_broad:
+                futures.append(loop.run_in_executor(executor, run_broad_engine, model_broad, working_frame, min_conf))
+
+            results = await asyncio.gather(*futures) if futures else []
+            raw_detections = [d for sub in results for d in sub]
+
+            filtered = [d for d in raw_detections if (d['x2'] - d['x1']) * (d['y2'] - d['y1']) <= max_area_px]
+            final_targets = non_max_suppression_fast(filtered)
+
+            telemetry_payload = draw_and_package(frame, final_targets)
+            draw_osd(frame, mode, min_conf, frame_meta)
+
+            # Safely attempt sending WebSocket payload if connected
+            if telemetry_payload and websocket:
+                try:
+                    payload = {
+                        "type": "detection",
+                        "stream_id": "drone1",
+                        "frame_meta": frame_meta,
+                        "targets": telemetry_payload
+                    }
+                    await websocket.send(json.dumps(payload))
+                except Exception:
+                    websocket = None  # Silently drop server pointer if dropped mid-flight
+
+            # GUI output rendering
+            display_frame = resize_for_display(frame, target_height=720)
+            cv2.imshow(window_title, display_frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+            await asyncio.sleep(0.001)
+
+    except Exception as e:
+        print(f"[ERROR] Critical ingestion loop error: {e}")
+    finally:
+        print("[INFO] Shutting down RTMP thread and destroying display windows...")
+        reader.stop()
+        executor.shutdown(wait=False)
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_pipeline())
+
+--- FILE: .\frontend\index.html ---
+
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DECS - Tactical Drone C2 Dashboard</title>
+    <!-- Leaflet GIS CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #090d16;
+            color: #f8fafc;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Tactical Header */
+        header {
+            background: #111827;
+            padding: 12px 20px;
+            border-bottom: 2px solid #1e293b;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        header h1 {
+            font-size: 1.2rem;
+            letter-spacing: 2px;
+            color: #38bdf8;
+            text-transform: uppercase;
+            font-weight: 700;
+        }
+
+        .status-container {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .status-badge {
+            background: #059669;
+            color: #fff;
+            font-weight: bold;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            letter-spacing: 1px;
+        }
+
+        /* Feed orientation indicator -- NEW */
+        .orientation-badge {
+            background: #1e293b;
+            border: 1px solid #334155;
+            color: #f59e0b;
+            font-weight: bold;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            letter-spacing: 1px;
+            font-family: 'Courier New', Courier, monospace;
+        }
+
+        /* Main Grid */
+        .container {
+            display: grid;
+            grid-template-columns: 2.2fr 1fr;
+            gap: 12px;
+            padding: 12px;
+            flex: 1;
+            height: calc(100vh - 60px);
+        }
+
+        /* Map UI */
+        #map {
+            width: 100%;
+            height: 100%;
+            border-radius: 6px;
+            border: 1px solid #1e293b;
+            background: #020617;
+        }
+
+        /* Admin & Control Sidebar */
+        .sidebar {
+            background: #0f172a;
+            border-radius: 6px;
+            border: 1px solid #1e293b;
+            display: flex;
+            flex-direction: column;
+            padding: 15px;
+            gap: 15px;
+            overflow-y: auto;
+        }
+
+        .sidebar h2 {
+            font-size: 0.95rem;
+            color: #38bdf8;
+            border-bottom: 1px solid #1e293b;
+            padding-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        /* Admin Controls Form */
+        .control-box {
+            background: #1e293b;
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid #334155;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .field-group {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        label {
+            font-size: 0.75rem;
+            color: #94a3b8;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        select,
+        input {
+            padding: 8px;
+            background: #0f172a;
+            border: 1px solid #475569;
+            border-radius: 4px;
+            color: #fff;
+            font-size: 0.85rem;
+        }
+
+        input[type="range"] {
+            padding: 0;
+            cursor: pointer;
+        }
+
+        .range-val {
+            font-size: 0.8rem;
+            color: #f59e0b;
+            float: right;
+        }
+
+        button.btn-primary {
+            background: #0284c7;
+            color: white;
+            padding: 10px;
+            border: none;
+            border-radius: 4px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: 0.2s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-size: 0.8rem;
+        }
+
+        button.btn-primary:hover {
+            background: #0369a1;
+        }
+
+        /* Telemetry Stream Log */
+        .feed-box {
+            background: #020617;
+            border-radius: 4px;
+            padding: 8px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.8rem;
+            height: 160px;
+            overflow-y: auto;
+            border: 1px solid #1e293b;
+        }
+
+        .feed-item {
+            margin-bottom: 4px;
+            border-bottom: 1px solid #0f172a;
+            padding-bottom: 2px;
+        }
+
+        .high-threat {
+            color: #ef4444;
+            font-weight: bold;
+        }
+
+        .norm-threat {
+            color: #38bdf8;
+        }
+
+        /* PostGIS Log Table */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.75rem;
+            text-align: left;
+        }
+
+        th,
+        td {
+            padding: 6px;
+            border-bottom: 1px solid #1e293b;
+        }
+
+        th {
+            color: #64748b;
+            text-transform: uppercase;
+        }
+
+        /*
+         * VIDEO PANEL PLACEHOLDER -- NEW
+         * Not wired to an actual video stream yet (the Python readers
+         * currently only send detection JSON, not raw video frames, over
+         * the WebSocket). This container's aspect-ratio is set dynamically
+         * from `frame_meta` in each telemetry message, so the moment a
+         * video source (e.g. an MJPEG endpoint or WebRTC feed) is added,
+         * it will already display at the correct orientation automatically.
+         */
+        #video-panel {
+            width: 100%;
+            max-height: 220px;
+            background: #020617;
+            border: 1px solid #1e293b;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #475569;
+            font-size: 0.75rem;
+            font-family: 'Courier New', Courier, monospace;
+            aspect-ratio: 16 / 9;
+            transition: aspect-ratio 0.2s ease;
+            overflow: hidden;
+        }
+    </style>
+</head>
+
+<body>
+
+    <header>
+        <h1>DECS Military Command & Control Center</h1>
+        <div class="status-container">
+            <div class="orientation-badge" id="orientation-badge">FEED: -- x -- (--)</div>
+            <div class="status-badge" id="ws-status">CONNECTING...</div>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Leaflet Map -->
+        <div id="map"></div>
+
+        <!-- Sidebar Panel -->
+        <div class="sidebar">
+
+            <!-- LIVE FEED ORIENTATION PANEL (placeholder, aspect-ratio-aware) -->
+            <h2>🎥 Live Feed Status</h2>
+            <div id="video-panel">No video frame stream connected — showing orientation metadata only</div>
+
+            <!-- ADMIN ENGINE CONTROLS -->
+            <h2>⚙️ Admin Detection Overrides</h2>
+            <div class="control-box">
+                <div class="field-group">
+                    <label>Detection Engine Mode</label>
+                    <select id="engine-mode">
+                        <option value="FAST_ONLY">FAST Engine Only (COCO — person/vehicle/animal)</option>
+                        <option value="BROAD_ONLY">BROAD Engine Only (Open-Vocab — buildings/bridges/etc.)</option>
+                        <option value="MILITARY_SPEC" selected>MIL-SPEC (FAST + BROAD Combined)</option>
+                    </select>
+                </div>
+
+                <div class="field-group">
+                    <label>Min Confidence Threshold <span class="range-val" id="conf-val">0.35</span></label>
+                    <input type="range" id="conf-slider" min="0.20" max="0.95" step="0.05" value="0.35"
+                        oninput="document.getElementById('conf-val').innerText = this.value">
+                </div>
+
+                <div class="field-group">
+                    <label>Max Object Area (% of screen) <span class="range-val" id="area-val">60%</span></label>
+                    <input type="range" id="area-slider" min="2" max="90" step="1" value="60"
+                        oninput="document.getElementById('area-val').innerText = this.value + '%'">
+                </div>
+
+                <div class="field-group">
+                    <label>Low Light / Glare Enhancement (CLAHE)</label>
+                    <select id="clahe-toggle">
+                        <option value="ENABLED" selected>Enabled (Auto Night/Glare Correction)</option>
+                        <option value="DISABLED">Disabled</option>
+                    </select>
+                </div>
+
+                <button class="btn-primary" onclick="pushAdminConfig()">Apply Admin Config</button>
+            </div>
+
+            <!-- LIVE TELEMETRY LOG -->
+            <h2>📡 Live Target Telemetry</h2>
+            <div class="feed-box" id="telemetry-log">
+                <div class="feed-item">Awaiting live drone telemetry...</div>
+            </div>
+
+            <!-- HISTORICAL QUERY -->
+            <h2>🗄️ Database Query</h2>
+            <div class="control-box">
+                <input type="text" id="class-filter" placeholder="Target Class (e.g. car, truck, boat)">
+                <button class="btn-primary" onclick="fetchHistory()" style="background: #334155;">Query PostGIS</button>
+            </div>
+
+            <div style="overflow-x: auto; max-height: 150px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Target</th>
+                            <th>Conf</th>
+                            <th>Lat/Lon</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-tbody">
+                        <tr>
+                            <td colspan="3">No records queried.</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        const map = L.map('map').setView([17.0253, 81.7779], 15);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        const markers = [];
+        const statusBadge = document.getElementById('ws-status');
+        const orientationBadge = document.getElementById('orientation-badge');
+        const videoPanel = document.getElementById('video-panel');
+        const telemetryLog = document.getElementById('telemetry-log');
+
+        const ws = new WebSocket(`ws://${window.location.host}/ws/telemetry`);
+
+        ws.onopen = () => {
+            statusBadge.innerText = 'C2 LINK ACTIVE';
+            statusBadge.style.background = '#059669';
+            pushAdminConfig(); // Send default config on startup
+        };
+
+        ws.onclose = () => {
+            statusBadge.innerText = 'C2 LINK DISCONNECTED';
+            statusBadge.style.background = '#dc2626';
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+
+            // --- NEW: orientation-aware handling ---
+            // Every detection payload now carries frame_meta (width/height/
+            // orientation/aspect_ratio) from whichever reader script sent it
+            // (rtmp_reader.py or scrcpy_reader.py). Update the badge + the
+            // video panel's aspect-ratio to match the CURRENT live feed,
+            // so the dashboard never assumes a fixed 16:9 or 9:16 shape.
+            if (data.frame_meta) {
+                const { width, height, orientation, aspect_ratio } = data.frame_meta;
+                orientationBadge.innerText = `FEED: ${width}x${height} (${aspect_ratio})`;
+                videoPanel.style.aspectRatio = `${width} / ${height}`;
+                videoPanel.dataset.orientation = orientation;
+            }
+
+            if (data.type === 'detection' && data.targets) {
+                data.targets.forEach(target => {
+                    const confText = `${(target.confidence * 100).toFixed(0)}%`;
+                    const isHigh = target.confidence >= 0.75;
+
+                    const item = document.createElement('div');
+                    item.className = `feed-item ${isHigh ? 'high-threat' : 'norm-threat'}`;
+                    item.innerText = `[${target.engine || 'C2'}] ${target.class_name.toUpperCase()} (${confText})`;
+                    telemetryLog.prepend(item);
+
+                    const marker = L.marker([target.latitude, target.longitude])
+                        .addTo(map)
+                        .bindPopup(`<b>${target.class_name.toUpperCase()}</b><br>Confidence: ${confText}<br>Engine: ${target.engine}`)
+                        .openPopup();
+
+                    markers.push(marker);
+                    if (markers.length > 25) {
+                        const oldMarker = markers.shift();
+                        map.removeLayer(oldMarker);
+                    }
+                });
+            }
+        };
+
+        function pushAdminConfig() {
+            const config = {
+                type: "admin_config",
+                engine_mode: document.getElementById('engine-mode').value,
+                min_confidence: parseFloat(document.getElementById('conf-slider').value),
+                max_area_pct: parseFloat(document.getElementById('area-slider').value),
+                clahe_enabled: document.getElementById('clahe-toggle').value === "ENABLED"
+            };
+
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(config));
+                console.log("[C2 COMMAND SENT]", config);
+            }
+        }
+
+        async function fetchHistory() {
+            const cls = document.getElementById('class-filter').value;
+            const tbody = document.getElementById('history-tbody');
+            tbody.innerHTML = '<tr><td colspan="3">Querying PostGIS...</td></tr>';
+
+            try {
+                const response = await fetch(`/api/detections/history?min_confidence=0.4&target_class=${cls}`);
+                const data = await response.json();
+                tbody.innerHTML = '';
+                if (data.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="3">No matches found.</td></tr>';
+                    return;
+                }
+                data.forEach(log => {
+                    const row = document.createElement('tr');
+                    row.innerHTML = `<td><b>${log.class_name}</b></td><td>${(log.confidence * 100).toFixed(0)}%</td><td>${log.latitude.toFixed(3)}, ${log.longitude.toFixed(3)}</td>`;
+                    tbody.appendChild(row);
+                });
+            } catch (err) {
+                tbody.innerHTML = '<tr><td colspan="3" style="color: #ef4444;">Query failed.</td></tr>';
+            }
+        }
+    </script>
+</body>
+
+</html>
+
+--- FILE: .\logging_module\logger.py ---
+
+# logging_module/logger.py
+import structlog
+import logging
+import sys
+from config_module.settings import settings
+
+def setup_logging():
+    logging.basicConfig(
+        format="%(message)s",
+        stream=sys.stdout,
+        level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    )
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer()
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+def get_logger(module_name: str):
+    return structlog.get_logger(module_name)
+
+--- FILE: .\message_broker\redis_producer.py ---
+
+# message_broker/redis_producer.py
+import redis.asyncio as aioredis
+import json
+from config_module.settings import settings
+from logging_module.logger import get_logger
+
+logger = get_logger("redis_producer")
+
+class StreamProducer:
+    def __init__(self, redis_url: str = None):
+        url = redis_url or getattr(settings, 'REDIS_URL', 'redis://localhost:6379')
+        self.redis = aioredis.from_url(url, decode_responses=True)
+
+    async def publish_telemetry(self, drone_id: str, telemetry_data: dict):
+        """Pushes real-time MAVLink telemetry into a Redis Stream."""
+        stream_key = f"stream:telemetry:{drone_id}"
+        await self.redis.xadd(
+            stream_key,
+            {"data": json.dumps(telemetry_data)},
+            maxlen=1000,
+            approximate=True
+        )
+
+    async def publish_frame_metadata(self, stream_id: str, frame_data: dict):
+        """Pushes decoded video frame payload into a Redis Stream."""
+        stream_key = f"stream:frames:{stream_id}"
+        await self.redis.xadd(
+            stream_key,
+            frame_data,
+            maxlen=500,
+            approximate=True
+        )
+
+    async def close(self):
+        await self.redis.aclose()
+
+--- FILE: .\tests\conftest.py ---
+
+# tests/conftest.py
+import pytest
+import pytest_asyncio
+from testcontainers.postgres import PostgresContainer
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from database_module.models import Base
+
+@pytest_asyncio.fixture
+async def db_engine():
+    # Spin up PostGIS container for tests
+    with PostgresContainer("postgis/postgis:16-3.4") as postgres:
+        raw_url = postgres.get_connection_url()
+        
+        # Explicitly ensure the asyncpg driver prefix is used
+        if raw_url.startswith("postgresql://"):
+            connection_url = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif "postgresql+asyncpg://" not in raw_url:
+            connection_url = f"postgresql+asyncpg://{raw_url.split('://', 1)[-1]}"
+        else:
+            connection_url = raw_url
+
+        engine = create_async_engine(connection_url, echo=False)
+        
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            
+        yield engine
+        
+        await engine.dispose()
+
+@pytest_asyncio.fixture
+async def db_session(db_engine):
+    async_session = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    async with async_session() as session:
+        yield session
+        await session.rollback()
+
+--- FILE: .\tests\test_phase1.py ---
+
+# tests/test_phase1.py
+import pytest
+from database_module.models import Incident, Detection
+from database_module.repository import DetectionRepository
+from auth_module.auth import create_access_token, decode_token
+
+def test_config_loading():
+    from config_module.settings import settings
+    assert settings.APP_NAME == "DECS Core Engine"
+    assert settings.POSTGRES_PORT == 5432
+
+def test_auth_token_lifecycle():
+    payload = {"sub": "user_123", "role": "commander"}
+    token = create_access_token(payload)
+    decoded = decode_token(token)
+    assert decoded["sub"] == "user_123"
+    assert decoded["role"] == "commander"
+
+@pytest.mark.asyncio
+async def test_database_repository(db_session):
+    incident = Incident(name="Test Flood Incident")
+    db_session.add(incident)
+    await db_session.commit()
+
+    repo = DetectionRepository(db_session)
+    detection = Detection(incident_id=incident.id, class_name="person", confidence=0.92, latitude=16.8, longitude=82.2)
+    saved = await repo.save(detection)
+
+    assert saved.id is not None
+    results = await repo.get_by_incident(incident.id)
+    assert len(results) == 1
+    assert results[0].class_name == "person"
+
+--- FILE: .\tests\test_phase2.py ---
+
+# tests/test_phase2.py
+import pytest
+import pytest_asyncio
+import json
+from testcontainers.redis import RedisContainer
+from message_broker.redis_producer import StreamProducer
+
+@pytest_asyncio.fixture
+async def redis_producer():
+    # Spins up a temporary Redis container automatically
+    with RedisContainer("redis:7-alpine") as redis_container:
+        host = redis_container.get_container_host_ip()
+        port = redis_container.get_exposed_port(6379)
+        redis_url = f"redis://{host}:{port}"
+        
+        producer = StreamProducer(redis_url=redis_url)
+        yield producer
+        await producer.close()
+
+@pytest.mark.asyncio
+async def test_redis_telemetry_stream(redis_producer):
+    drone_id = "test_drone_01"
+    telemetry_payload = {
+        "lat": 16.82,
+        "lon": 82.23,
+        "alt": 45.5,
+        "heading": 180.0
+    }
+    
+    # 1. Publish telemetry payload to Redis Stream
+    await redis_producer.publish_telemetry(drone_id=drone_id, telemetry_data=telemetry_payload)
+    
+    # 2. Read back from Redis Stream
+    stream_key = f"stream:telemetry:{drone_id}"
+    messages = await redis_producer.redis.xread({stream_key: '0-0'}, count=1)
+    
+    assert len(messages) > 0
+    stream_name, entries = messages[0]
+    entry_id, data = entries[0]
+    
+    parsed = json.loads(data["data"])
+    assert parsed["lat"] == 16.82
+    assert parsed["heading"] == 180.0
+
+    # Clean up
+    await redis_producer.redis.delete(stream_key)
+
+--- FILE: .\tests\test_phase3.py ---
+
+import pytest
+from ai_analytics.detector import TargetDetector
+
+def test_target_detector_pipeline():
+    detector = TargetDetector(confidence_threshold=0.5)
+    
+    mock_frame_meta = {"frame_id": 101, "stream_id": "stream_alpha"}
+    mock_telemetry = {
+        "lat": 16.8200,
+        "lon": 82.2300,
+        "alt": 100.0,
+        "heading": 90.0
+    }
+    
+    detections = detector.process_frame(mock_frame_meta, mock_telemetry)
+    
+    assert len(detections) == 1
+    target = detections[0]
+    
+    assert target["class_name"] == "surveillance_target"
+    assert target["confidence"] == 0.88
+    
+    # Due East heading (90 deg): latitude remains ~16.82, longitude increases Eastward
+    assert pytest.approx(target["latitude"], abs=1e-5) == 16.8200
+    assert target["longitude"] > 82.2300
+
+
+--- FILE: .\tests\test_phase4.py ---
+
+# tests/test_phase4.py
+import pytest
+from fastapi.testclient import TestClient
+from api.main import app
+
+client = TestClient(app)
+
+def test_api_root():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.json()["status"] == "online"
+
+def test_websocket_telemetry_stream():
+    with client.websocket_connect("/ws/telemetry") as websocket:
+        assert websocket is not None
