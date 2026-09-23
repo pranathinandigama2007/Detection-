@@ -1,15 +1,9 @@
 """
-DECS - Universal Multi-Input Tactical Hub (Military-Grade Accuracy Edition)
-============================================================================
-- Universal Ingestion: RTMP, RTSP, HTTP/HTTPS, UDP, and Native Skydroid GCS Feeds
-- Crash-proof, auto-reconnecting capture loop (proven stable design from
-  the "detection f2" production build)
-- Dual-model ensemble detection with periodic tiled deep passes for
-  maximum small/distant-object recall at drone altitude (see
-  drone_ingestion/detection_utils.py)
-- Dynamic rotation routing (0deg, 90deg, 180deg, 270deg) -- works the same
-  whether the feed is a gimbal-stabilized drone camera or a handheld phone
-- Automatic IP geolocation fallback
+DECS - Multi-Input C2 Tactical Hub
+==================================
+- Target Lock Endpoint API with Instant Clean Validation
+- Real-time High FPS Video & Telemetry Pipeline
+- Multi-protocol ingestion & zero-latency recording
 """
 
 import sys
@@ -19,11 +13,10 @@ import json
 import asyncio
 import threading
 import time
-import numpy as np
 import urllib.request
-from typing import Set
+from typing import Set, Optional
 from pydantic import BaseModel
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -34,104 +27,11 @@ if BASE_DIR not in sys.path:
 
 from drone_ingestion.detection_utils import (
     HighPerformanceDetector,
-    TargetMatcher,
     draw_and_package,
     get_local_ip,
 )
 
-
-class DetectionRecorder:
-    """
-    Records the DETECTED feed (the same annotated frame streamed to the
-    dashboard, boxes/labels included) to a local .mp4 file -- not the
-    dashboard UI itself, just the processed video. Supports start/pause/
-    resume/stop. The save folder is chosen by the user per-recording via
-    the dashboard's "Save Location" field, since this is a local desktop
-    app scenario rather than a browser-sandboxed one -- the Python backend
-    writes directly to whatever filesystem path is given.
-    """
-
-    def __init__(self, default_dir):
-        self.default_dir = default_dir
-        self.writer = None
-        self.state = "IDLE"  # IDLE, RECORDING, PAUSED
-        self.filepath = None
-        self.fps = 15.0
-        self.frame_size = None
-        self.lock = threading.Lock()
-
-    def start(self, frame, save_dir=None):
-        with self.lock:
-            if self.state in ("RECORDING", "PAUSED"):
-                return {"status": "ERROR", "message": "A recording is already in progress. Stop it first."}
-            if frame is None:
-                return {"status": "ERROR", "message": "No live frame available yet -- connect a stream first."}
-
-            target_dir = (save_dir or "").strip() or self.default_dir
-            try:
-                os.makedirs(target_dir, exist_ok=True)
-            except Exception as e:
-                return {"status": "ERROR", "message": f"Could not create/access folder '{target_dir}': {e}"}
-
-            h, w = frame.shape[:2]
-            self.frame_size = (w, h)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"DECS_detected_feed_{ts}.mp4"
-            filepath = os.path.join(target_dir, filename)
-
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(filepath, fourcc, self.fps, self.frame_size)
-            if not writer.isOpened():
-                return {"status": "ERROR", "message": f"OpenCV could not open a writer for '{filepath}'."}
-
-            self.writer = writer
-            self.filepath = filepath
-            self.state = "RECORDING"
-            print(f"[RECORDER] Started -> {filepath}")
-            return {"status": "RECORDING", "filepath": filepath}
-
-    def write_frame(self, frame):
-        # Called from the inference worker for every processed frame.
-        with self.lock:
-            if self.state != "RECORDING" or self.writer is None:
-                return
-            h, w = frame.shape[:2]
-            if (w, h) != self.frame_size:
-                frame = cv2.resize(frame, self.frame_size)
-            self.writer.write(frame)
-
-    def pause(self):
-        with self.lock:
-            if self.state == "RECORDING":
-                self.state = "PAUSED"
-                return {"status": "PAUSED", "filepath": self.filepath}
-            return {"status": "ERROR", "message": f"Cannot pause from state {self.state}."}
-
-    def resume(self):
-        with self.lock:
-            if self.state == "PAUSED":
-                self.state = "RECORDING"
-                return {"status": "RECORDING", "filepath": self.filepath}
-            return {"status": "ERROR", "message": f"Cannot resume from state {self.state}."}
-
-    def stop(self):
-        with self.lock:
-            if self.state == "IDLE" or self.writer is None:
-                return {"status": "ERROR", "message": "No active recording to stop."}
-            self.writer.release()
-            self.writer = None
-            path = self.filepath
-            self.filepath = None
-            self.frame_size = None
-            self.state = "IDLE"
-            print(f"[RECORDER] Stopped -> {path}")
-            return {"status": "STOPPED", "filepath": path}
-
-    def get_status(self):
-        with self.lock:
-            return {"state": self.state, "filepath": self.filepath}
-
-app = FastAPI(title="DECS Universal Tactical C2 Hub", version="19.0")
+app = FastAPI(title="DECS Universal Tactical C2 Hub", version="18.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -149,7 +49,6 @@ class LiveLocationState:
 
 location_state = LiveLocationState()
 
-# Resolve Host Location on startup
 try:
     req = urllib.request.Request(
         "https://ipapi.co/json/",
@@ -175,38 +74,29 @@ class VideoHub:
 hub = VideoHub()
 
 class UniversalIngestionPipeline:
-    """
-    Crash-proof, self-healing capture pipeline (based on the proven
-    "detection f2" ResilientPipeline design) extended to accept ANY input
-    protocol OpenCV/FFmpeg can open: RTSP, RTMP, HTTP(S) MJPEG/MPEG-TS,
-    UDP raw streams, and Skydroid GCS RTSP feeds. The capture loop itself
-    doesn't need to know or care which protocol it's reading -- FFmpeg
-    handles that -- so this class is unchanged in structure from the
-    stable single-protocol version, only the URL fed into it differs.
-    """
-
     def __init__(self):
         self.stream_url = None
         self.is_running = False
-
+        
         self.cap_thread = None
         self.infer_thread = None
-
+        
         self.latest_raw_frame = None
         self.latest_processed_jpeg = None
         self.latest_targets = []
         self.lock = threading.Lock()
-
-        self.detector = None
+        
+        self.detector = HighPerformanceDetector(conf_threshold=0.35)
         self.active_category = "ALL"
         self.active_orientation = 0
 
-        self.recorder = DetectionRecorder(default_dir=os.path.join(BASE_DIR, "recordings"))
-        self.target_matcher = TargetMatcher()
+        self.is_recording = False
+        self.is_recording_paused = False
+        self.record_writer = None
+        self.record_filepath = None
 
     def set_orientation(self, deg: int):
         self.active_orientation = deg % 360
-        print(f"[TACTICAL HUB] Active Vision Angle set to: {self.active_orientation} deg")
 
     def set_filter(self, category: str):
         self.active_category = category.upper()
@@ -216,11 +106,6 @@ class UniversalIngestionPipeline:
         self.stream_url = stream_url.strip()
         self.is_running = True
 
-        if self.detector is None:
-            self.detector = HighPerformanceDetector(conf_threshold=0.22)
-
-        print(f"[TACTICAL HUB] Pipeline active on: {self.stream_url}")
-
         self.cap_thread = threading.Thread(target=self._capture_pump, daemon=True)
         self.infer_thread = threading.Thread(target=self._inference_worker, daemon=True)
 
@@ -228,46 +113,64 @@ class UniversalIngestionPipeline:
         self.infer_thread.start()
 
     def stop(self):
+        self.stop_recording()
         self.is_running = False
         if self.cap_thread and self.cap_thread.is_alive():
             self.cap_thread.join(timeout=0.6)
         if self.infer_thread and self.infer_thread.is_alive():
             self.infer_thread.join(timeout=0.6)
-
-        # Never leave a video file handle open if the stream disconnects
-        # mid-recording.
-        if self.recorder.state != "IDLE":
-            self.recorder.stop()
-
+            
         self.latest_raw_frame = None
         self.latest_processed_jpeg = None
         self.latest_targets = []
         self.stream_url = None
 
+    def start_recording(self, save_dir: Optional[str] = None):
+        if not self.is_running:
+            return False, "No active stream to record."
+        
+        if not save_dir or not os.path.exists(save_dir):
+            save_dir = os.path.join(BASE_DIR, "recordings")
+        
+        os.makedirs(save_dir, exist_ok=True)
+        filename = f"DECS_RECORDING_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+        self.record_filepath = os.path.join(save_dir, filename)
+        
+        self.is_recording = True
+        self.is_recording_paused = False
+        return True, self.record_filepath
+
+    def pause_recording(self):
+        if self.is_recording:
+            self.is_recording_paused = True
+            return True, self.record_filepath
+        return False, "Not recording"
+
+    def resume_recording(self):
+        if self.is_recording:
+            self.is_recording_paused = False
+            return True, self.record_filepath
+        return False, "Not recording"
+
+    def stop_recording(self):
+        self.is_recording = False
+        self.is_recording_paused = False
+        if self.record_writer is not None:
+            self.record_writer.release()
+            self.record_writer = None
+        path = self.record_filepath
+        self.record_filepath = None
+        return path
+
     def _capture_pump(self):
-        """
-        Universal capture pump supporting:
-        - RTSP / TCP
-        - Direct RTMP
-        - HTTP / HTTPS (MPEG-TS, MJPEG)
-        - UDP Raw Video Streams
-        - Skydroid GCS RTSP feeds
-        Self-healing: survives reconnects, drops, and temporary stream gaps
-        without crashing the process.
-        """
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-            "rtsp_transport;tcp|fflags;nobuffer+discardcorrupt|flags;low_delay|"
-            "max_delay;0|probesize;32|analyzeduration;0|sync;ext"
+            "rtsp_transport;tcp|fflags;nobuffer+discardcorrupt|flags;low_delay|max_delay;0|probesize;32|analyzeduration;0|sync;ext"
         )
         cap = None
         fail_count = 0
 
         while self.is_running:
             if cap is None or not cap.isOpened():
-                # Direct hardware/network open via OpenCV CAP_FFMPEG -- this
-                # single call transparently handles rtsp://, rtmp://, http://,
-                # https://, and udp:// URLs; FFmpeg picks the right demuxer
-                # based on the URL scheme.
                 cap = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 time.sleep(0.3)
@@ -277,12 +180,12 @@ class UniversalIngestionPipeline:
             grabbed = cap.grab()
             if not grabbed:
                 fail_count += 1
-                if fail_count > 30:  # Stream temporarily interrupted
+                if fail_count > 30:
                     cap.release()
                     cap = None
-                    time.sleep(0.5)
+                    time.sleep(0.4)
                 else:
-                    time.sleep(0.01)
+                    time.sleep(0.005)
                 continue
 
             fail_count = 0
@@ -295,7 +198,7 @@ class UniversalIngestionPipeline:
             cap.release()
 
     def _inference_worker(self):
-        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 65]
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 78]
 
         while self.is_running:
             frame_sample = None
@@ -310,22 +213,12 @@ class UniversalIngestionPipeline:
                 time.sleep(0.01)
                 continue
 
-            # Orientation-invariant inference pass (fast full-frame every
-            # call, periodic tiled deep pass for small/distant targets --
-            # see HighPerformanceDetector.detect in detection_utils.py)
             targets = self.detector.detect(
                 frame_sample,
-                input_size=288,
+                input_size=416,
                 active_category=cat,
                 orientation_deg=deg
             )
-
-            # If a target lock is active, collapse the full detection list
-            # down to (at most) the single best match -- this is what
-            # implements "stop all remaining detection, search only for
-            # this one thing".
-            if self.target_matcher.active:
-                targets = self.target_matcher.find_best_match(frame_sample, targets)
 
             draw_and_package(
                 frame_sample,
@@ -333,9 +226,12 @@ class UniversalIngestionPipeline:
                 drone_telemetry={"lat": location_state.latitude, "lon": location_state.longitude}
             )
 
-            # Record the DETECTED feed (post-annotation), not the raw feed
-            # and not the dashboard UI -- exactly what gets streamed below.
-            self.recorder.write_frame(frame_sample)
+            if self.is_recording and not self.is_recording_paused:
+                h, w = frame_sample.shape[:2]
+                if self.record_writer is None:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    self.record_writer = cv2.VideoWriter(self.record_filepath, fourcc, 20.0, (w, h))
+                self.record_writer.write(frame_sample)
 
             _, buf = cv2.imencode('.jpg', frame_sample, encode_params)
             jpeg_bytes = buf.tobytes()
@@ -344,12 +240,12 @@ class UniversalIngestionPipeline:
                 self.latest_targets = targets
                 self.latest_processed_jpeg = jpeg_bytes
 
-            time.sleep(0.025)
+            time.sleep(0.012)
 
 pipeline = UniversalIngestionPipeline()
 
 class StreamConfigRequest(BaseModel):
-    source_type: str = "rtsp"  # "rtmp", "rtsp", "skydroid", "http", "https", "custom"
+    source_type: str = "rtsp"
     url: str = ""
     ip: str = "127.0.0.1"
     port: int = 1935
@@ -361,10 +257,52 @@ class OrientationRequest(BaseModel):
 class FilterConfigRequest(BaseModel):
     category: str
 
+class RecordStartRequest(BaseModel):
+    save_dir: Optional[str] = None
+
 class ClientLocationReport(BaseModel):
     latitude: float
     longitude: float
     accuracy: float
+
+@app.post("/api/target/set")
+async def set_target_lock(file: UploadFile = File(...)):
+    contents = await file.read()
+    success, result_label = pipeline.detector.set_target_lock(contents, filename=file.filename)
+    if success:
+        return {"status": "TARGET_LOCKED", "label": result_label}
+    return {"status": "ERROR", "message": result_label}
+
+@app.post("/api/target/clear")
+async def clear_target_lock():
+    pipeline.detector.clear_target_lock()
+    return {"status": "TARGET_CLEARED"}
+
+@app.post("/api/record/start")
+async def start_recording(req: RecordStartRequest):
+    ok, path_or_msg = pipeline.start_recording(req.save_dir)
+    if ok:
+        return {"status": "RECORDING", "filepath": path_or_msg}
+    return {"status": "ERROR", "message": path_or_msg}
+
+@app.post("/api/record/pause")
+async def pause_recording():
+    ok, path_or_msg = pipeline.pause_recording()
+    if ok:
+        return {"status": "PAUSED", "filepath": path_or_msg}
+    return {"status": "ERROR", "message": path_or_msg}
+
+@app.post("/api/record/resume")
+async def resume_recording():
+    ok, path_or_msg = pipeline.resume_recording()
+    if ok:
+        return {"status": "RECORDING", "filepath": path_or_msg}
+    return {"status": "ERROR", "message": path_or_msg}
+
+@app.post("/api/record/stop")
+async def stop_recording():
+    saved_path = pipeline.stop_recording()
+    return {"status": "STOPPED", "filepath": saved_path or "None"}
 
 @app.post("/api/stream/orientation")
 async def update_stream_orientation(req: OrientationRequest):
@@ -396,26 +334,17 @@ async def get_system_info():
 
 @app.post("/api/stream/connect")
 async def connect_stream(cfg: StreamConfigRequest):
-    # Route based on selected protocol / equipment
     if cfg.source_type == "custom" and cfg.url:
         target_uri = cfg.url.strip()
     elif cfg.source_type == "skydroid":
-        # Direct Skydroid H12/H16 default LAN RTSP or custom URL
         target_uri = cfg.url.strip() if cfg.url else "rtsp://192.168.144.108:554/live/ch0"
     elif cfg.source_type in ["http", "https"]:
         target_uri = cfg.url.strip()
     elif cfg.source_type == "rtsp":
-        if cfg.url:
-            target_uri = cfg.url.strip()
-        else:
-            clean_path = cfg.path.lstrip("/")
-            target_uri = f"rtsp://{cfg.ip}:{cfg.port}/{clean_path}"
+        target_uri = cfg.url.strip() if cfg.url else f"rtsp://{cfg.ip}:{cfg.port}/{cfg.path.lstrip('/')}"
     else:
-        # Default internal MediaMTX RTSP bridge for incoming RTMP mobile feeds
-        clean_path = cfg.path.lstrip("/")
-        target_uri = f"rtsp://127.0.0.1:8554/{clean_path}"
+        target_uri = f"rtsp://127.0.0.1:8554/{cfg.path.lstrip('/')}"
 
-    print(f"[STREAM INGEST] Resolving input URI: {target_uri}")
     pipeline.start(target_uri)
     return {"status": "CONNECTED", "url": target_uri}
 
@@ -423,89 +352,6 @@ async def connect_stream(cfg: StreamConfigRequest):
 async def disconnect_stream():
     pipeline.stop()
     return {"status": "DISCONNECTED"}
-
-# ---------------------------------------------------------------------------
-# Recording controls -- records the DETECTED (annotated) feed only, not the
-# whole dashboard. Start / Pause / Resume / Stop.
-# ---------------------------------------------------------------------------
-class RecordStartRequest(BaseModel):
-    save_dir: str = ""  # user-chosen folder; blank = default ./recordings
-
-@app.post("/api/record/start")
-async def start_recording(req: RecordStartRequest):
-    with pipeline.lock:
-        frame = pipeline.latest_raw_frame
-    if not pipeline.is_running or frame is None:
-        return {"status": "ERROR", "message": "No active detected feed to record. Connect a stream first."}
-    return pipeline.recorder.start(frame, save_dir=req.save_dir)
-
-@app.post("/api/record/pause")
-async def pause_recording():
-    return pipeline.recorder.pause()
-
-@app.post("/api/record/resume")
-async def resume_recording():
-    return pipeline.recorder.resume()
-
-@app.post("/api/record/stop")
-async def stop_recording():
-    return pipeline.recorder.stop()
-
-@app.get("/api/record/status")
-async def recording_status():
-    return pipeline.recorder.get_status()
-
-# ---------------------------------------------------------------------------
-# Target lock -- upload a reference image of a specific object/animal/person,
-# the pipeline narrows detection down to matches of that specific target only.
-# See TargetMatcher in drone_ingestion/detection_utils.py for how matching
-# works and its real accuracy limits (classical CV, not deep face-recognition).
-# ---------------------------------------------------------------------------
-@app.post("/api/target/set")
-async def set_target(file: UploadFile = File(...)):
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    ref_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if ref_img is None:
-        return {"status": "ERROR", "message": "Could not decode uploaded image."}
-
-    # Ensure a detector exists (even before a stream is connected) so we can
-    # run detection on the reference image itself to auto-crop the main
-    # subject and infer its category (HUMAN/ANIMAL/OBJECT).
-    if pipeline.detector is None:
-        pipeline.detector = HighPerformanceDetector(conf_threshold=0.22)
-
-    ref_targets = pipeline.detector.detect(ref_img, input_size=320, active_category="ALL", orientation_deg=0)
-    if ref_targets:
-        main = max(ref_targets, key=lambda t: (t["x2"] - t["x1"]) * (t["y2"] - t["y1"]))
-        crop = ref_img[main["y1"]:main["y2"], main["x1"]:main["x2"]]
-        category = main["category"]
-        label = main["class_name"]
-    else:
-        # Nothing detected in the reference image (e.g. a tight face crop
-        # with no full body) -- fall back to using the whole image.
-        crop = ref_img
-        category = None
-        label = "CUSTOM TARGET"
-
-    ok = pipeline.target_matcher.set_reference(crop, category_hint=category, label=label)
-    if not ok:
-        return {"status": "ERROR", "message": "Reference image was empty or invalid."}
-
-    return {"status": "TARGET_LOCKED", "category": category, "label": label}
-
-@app.post("/api/target/clear")
-async def clear_target():
-    pipeline.target_matcher.clear()
-    return {"status": "TARGET_CLEARED"}
-
-@app.get("/api/target/status")
-async def target_status():
-    return {
-        "active": pipeline.target_matcher.active,
-        "label": pipeline.target_matcher.label,
-        "category": pipeline.target_matcher.ref_category,
-    }
 
 @app.websocket("/ws/telemetry")
 async def websocket_telemetry_endpoint(ws: WebSocket):
@@ -518,7 +364,7 @@ async def websocket_telemetry_endpoint(ws: WebSocket):
                 targets = list(pipeline.latest_targets)
             if targets:
                 await ws.send_text(json.dumps({"type": "detection", "targets": targets}))
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.05)
     except (WebSocketDisconnect, Exception):
         hub.remove_telemetry(ws)
 
@@ -533,7 +379,7 @@ async def websocket_video_endpoint(ws: WebSocket):
                 frame_bytes = pipeline.latest_processed_jpeg
             if frame_bytes is not None:
                 await ws.send_bytes(frame_bytes)
-            await asyncio.sleep(0.025)
+            await asyncio.sleep(0.02)
     except (WebSocketDisconnect, Exception):
         hub.remove_video(ws)
 
